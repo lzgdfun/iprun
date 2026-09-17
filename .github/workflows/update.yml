@@ -1,0 +1,69 @@
+name: IP 清单定时更新（全量/增量）
+
+# 北京时间每周五 00:00 执行 = UTC 每周四 16:00
+# GitHub Actions 的 cron 一律使用 UTC，且高峰期可能有几分钟延迟。
+on:
+  schedule:
+    - cron: '0 16 * * 4'
+  workflow_dispatch: {}      # 支持手动触发（用于首次验证或补跑）
+
+# 需要写权限才能把更新结果提交回仓库
+permissions:
+  contents: write
+
+# 同一时间只允许一个实例，避免并发写坏数据
+concurrency:
+  group: ip-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 首次引导（用种子文件初始化 all.txt / go.csv）
+        run: python -u bootstrap.py
+
+      - name: 采集四个数据源 + 计算净新增
+        run: python -u fetch_sources.py
+
+      - name: 更新 all.txt（旧 ∪ 新增）
+        run: python -u apply_update.py
+
+      - name: 补全 CIDR 归属并生成 all.csv（最多 6 轮，直到零空白）
+        run: |
+          for i in 1 2 3 4 5 6; do
+            python -u enrich_cidrs.py
+            if python -u verify.py --only-blank; then
+              echo "归属已全部补全，退出重试循环"
+              break
+            fi
+            echo "第 $i 轮仍有空归属，20 秒后重试…"
+            sleep 20
+          done
+
+      - name: 更新 go.csv
+        run: python -u update_go.py 新增IP.txt
+
+      - name: 校验产物
+        run: python -u verify.py
+
+      - name: 提交结果
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "无变更，无需提交"
+          else
+            git commit -m "chore: 定时更新 IP 清单 $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
