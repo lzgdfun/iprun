@@ -14,12 +14,19 @@ Cloudflare IP 清单的**全自动清洗流水线**。云端定时运行，无�
 
 | 步骤 | 脚本 | 作用 |
 |---|---|---|
+| 0 | `step_newdata.py` | **条件执行**：若仓库里存在 `新数据/` 文件夹且有测速 CSV，则合并进 `go.csv`（去重、择优）并把其 IP 增量并入 `all.txt` / `all.csv`；**没有 CSV 时自动 SKIP**，不是错误 |
 | 1 | `bootstrap.py` | 首次运行时用种子文件初始化 `all.txt` / `go.csv`，保证迁移前历史数据不丢 |
 | 2 | `fetch_sources.py` | 采集 4 个数据源 → 合并去重 → 与 `all.txt` 对比算出**净新增** |
 | 3 | `apply_update.py` | `all.txt` = 旧 ∪ 新增，按 IP 数值升序去重 |
 | 4 | `enrich_cidrs.py` | 按 /24 归并并补全每个网段的**归属厂商 / 归属地** → 生成 `all.csv` |
-| 5 | `update_go.py` | 把新增 IP 并入 `go.csv`（新增行指标列为空） |
+| 5 | `update_go.py` | 把新增 IP 并入 `go.csv`（新增行指标列为空；不会清掉第 0 步填好的指标） |
 | 6 | `verify.py` | 校验升序、唯一、新增 IP 三文件全覆盖、归属零空白 |
+
+> 步骤 0 的说明：把测速结果 CSV 放进仓库的 `新数据/` 目录（可含子目录）并提交，下次运行就会自动并入。CSV 表头应为
+> `IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码,端口`；流程只保留后 4 列中的
+> `IP 地址 / 平均延迟 / 下载速度(MB/s) / 地区码`，丢弃 `已发送 / 已接收 / 丢包率 / 端口`。
+> 同一 IP 出现多次时保留**平均延迟最低**的记录（无延迟指标的记录优先级最低），原有无指标的记录会被**自动补全**。
+> 该步骤按 IP 去重，**幂等**——重复放入同一批 CSV 不会改变结果。
 
 ## 数据源（4 个）
 
@@ -43,7 +50,8 @@ Cloudflare IP 清单的**全自动清洗流水线**。云端定时运行，无�
 ## 本机手动运行（等价流程）
 
 ```bash
-python -u bootstrap.py
+python -u step_newdata.py           # 第 0 步：无 新数据/ CSV 时会打印 SKIP 并正常退出
+python -u bootstrap.py              # 仅首次运行需要
 python -u fetch_sources.py
 python -u apply_update.py
 for i in 1 2 3 4 5 6; do python -u enrich_cidrs.py && python -u verify.py --only-blank && break; sleep 20; done

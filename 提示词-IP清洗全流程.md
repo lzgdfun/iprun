@@ -2,6 +2,7 @@
 
 > **用法**：整段直接粘贴给任意 AI 智能体即可。它会先自动判断该走「全量重建」还是「增量更新」，然后完成采集、去重、CIDR 归属补全，产出 `all.txt` / `all.csv` / `go.csv` 三个文件。
 > **本提示词自包含**：不依赖上游脚本存在，附录 A 提供了可直接抄写的参考实现代码。
+> **条件步骤**：若工作目录下的 `新数据/` 文件夹里有测速 CSV，流程会先执行**步骤 0**（把这些 CSV 合并进 `go.csv`，并把其中的 IP 增量并入 `all.txt` / `all.csv`）；文件夹不存在或没有 CSV 则自动跳过，不影响后续流程。
 
 ---
 
@@ -27,7 +28,7 @@
 
 - 工作目录：当前项目目录（例如 `D:\tools\workbuddy\数据清洗`）。
 - 全部读写在本机完成并落盘，命令行工具在**工作目录内**执行。
-- 产物文件：`all.txt`、`all.csv`、`go.csv`；中间文件：`本轮数据源.txt`（本轮所有源去重后合集）、`新增IP.txt`（相对上次的净新增）。
+- 产物文件：`all.txt`、`all.csv`、`go.csv`；中间文件：`本轮数据源.txt`（本轮所有源去重后合集）、`新增IP.txt`（相对上次的净新增）、`新增IP_新数据.txt`（来自「新数据」CSV 的净新增，留痕用）。
 - 缓存目录：`.workbuddy/_src_cache/`（外链原始快照）、`.workbuddy/_enrich_cache.json`（CIDR 归属增量缓存）、`.workbuddy/_backup/`（主表备份）。
 - 优先使用受管 Python（例：`C:\Users\38231\.workbuddy\binaries\python\versions\3.13.12\python.exe`），**仅用标准库**，无需安装依赖。若该路径不存在，用本机任意 Python 3.8+。
 
@@ -44,6 +45,8 @@
 
 **附加（可选）**：若工作目录下还存在其它 IP 文本文件（每行一个 IPv4，如 `p1.txt`、`新增数据.txt` 等），**全量重建时**应一并纳入；**增量更新时**默认不纳入（避免把历史文件重复算作新增），除非用户明确要求。
 
+**附加（条件执行）**：若工作目录下存在 `新数据/` 文件夹，其中的 `*.csv`（递归匹配）是**测速结果**，属于额外数据源，按下文**步骤 0** 处理。该文件夹不存在或没有 CSV 时，整步跳过，不是错误。
+
 > 关键坑：源 4 给的是 GitHub **blob 网页**地址，必须转成 `raw.githubusercontent.com` 才能拿到纯文本；直接抓网页会拿到 HTML。
 
 ---
@@ -59,9 +62,33 @@
   - `all.csv` 由流程自动生成，无需预建。
 - 两种模式**后续命令流程完全一致**，无需写两套分支逻辑。
 
+**注意**：无论走哪种模式，若 `新数据/` 文件夹里有测速 CSV，都要先执行第五节的**步骤 0**（条件步骤）。
+
 ---
 
 ## 五、处理流程
+
+### 步骤 0（条件执行）：合并 `新数据/` 文件夹里的测速 CSV
+
+**触发条件**：工作目录下的 `新数据/` 文件夹存在，且其中（含子目录）至少有一个 `*.csv`。
+**否则**：打印一行 `SKIP: ...` 并正常结束本步骤（退出码 0），直接进入步骤 1。**跳过是预期行为，不是失败，不得因此中止整个任务。**
+
+1. **扫描**：递归收集 `新数据/` 下所有 `*.csv`。
+2. **解析**：以 `utf-8-sig` 读取。标准表头为 `IP 地址,已发送,已接收,丢包率,平均延迟,下载速度(MB/s),地区码,端口`。
+   - 表头列名可能略有出入，建议按关键字模糊匹配（含「IP」→ IP 列，含「延迟」→ 平均延迟，含「速度」→ 下载速度，含「地区」→ 地区码）。
+   - 兜底：若某文件没有标准表头（内容形如 `IP:443` 的裸行），则取冒号前的 IP，指标列留空。
+   - 非法 IP 行计数跳过，不中断。
+3. **只保留 4 列**：`IP 地址` / `平均延迟` / `下载速度(MB/s)` / `地区码`；**丢弃** `已发送`、`已接收`、`丢包率`、`端口`。
+4. **按 IP 去重合并进 `go.csv`**，择优规则（同 IP 只留一行）：
+   1. 有数值 `平均延迟` 的优先于没有的；
+   2. 都有指标时，`平均延迟` **最低**者优先；
+   3. 再相同则 `下载速度(MB/s)` **最高**者优先；
+   4. 仍相同则带 `地区码` 者优先。
+   已存在于 `go.csv` 的记录同样参与比较——因此**原先指标为空的记录会被自动补全**，指标更优的记录会被**升级**。
+   输出按 **IP 数值升序**、编码 **UTF-8 with BOM**，覆盖前备份旧 `go.csv`。
+5. **增量更新 `all.txt`**：`all.txt = 旧 all.txt ∪ (CSV 中出现的 IP)`，按数值升序落盘（覆盖前备份）。同时把净新增写成 `新增IP_新数据.txt` 留痕。
+6. **重生成 `all.csv`**：直接复用步骤 3 的归属补全脚本（读 `all.txt` → 写 `all.csv`），走同一份增量缓存。
+7. **幂等**：整步按 IP 去重，同一批 CSV 反复执行结果完全一致（文件字节不变）。
 
 ### 步骤 1：采集 + 解析 + 求新增
 1. **解析 `dns.txt`**：逐行读域名 → 查询 A 记录（用 `socket.gethostbyname_ex`，只保留 IPv4）。
@@ -136,12 +163,15 @@
 3. `新增IP.txt` 中的**每一个 IP** 都同时存在于：`all.txt`、`all.csv` 的 `IP列表` 列、`go.csv`。
 4. `all.csv` 的归属列**无空白**（`空归属 = 0`）。
 5. `all.txt` 与 `all.csv` 基于**同一份去重 IP 集合**，保持自洽（可用 `all.csv` 中 IP 数量之和与 `all.txt` 行数是否相等的近似校验：数量之和应等于 `all.txt` 行数）。
+6. 若执行了**步骤 0**：`新数据/` 中 CSV 出现的**每一个 IP** 都必须存在于 `go.csv` 与 `all.txt`；`go.csv` 中该批 IP 的指标列应已填充（原为空、CSV 有值的记录不能仍为空）。
+7. 幂等性自检：在无新增的情况下再跑一次，`all.txt` / `all.csv` / `go.csv` 三个文件的字节内容不应发生变化。
 
 ---
 
 ## 九、汇报要求
 
 完成后输出：
+- **步骤 0 的结果**：是 `SKIP`（并说明是目录不存在还是无 CSV）还是已执行；执行时给出 CSV 文件数、读入数据行数、去重后唯一 IP 数、并入 `go.csv` 的新增行数与「补全/升级」行数、并入 `all.txt` 的净新增数。
 - 各源分别解析出的**唯一 IPv4 数**；`dns.txt` 解析**成功/失败域名数**（列出失败域名）。
 - 各源**去重合计**、与旧 `all.txt` 的**重叠数**、**净新增数**、**合并后总数**。
 - 三个文件（`all.txt` / `all.csv` / `go.csv`）**变化的行数**（前 → 后）。
@@ -167,11 +197,12 @@
 - **查询语言**：默认中文；改为英文归属地用 `lang=en`。
 - **是否保留 `IP列表` 列**：默认保留；只要 CIDR + 数量时可去掉。
 - **数据源增减**：某源长期失效时删除或替换；`dns.txt` 域名清单可随时更新。
+- **新数据文件夹**：默认 `新数据/`（递归匹配 `*.csv`），可改为其它目录名；若 CSV 表头列名变化，靠关键字模糊匹配自动适配。
 - **输出位置**：默认工作目录根；可指定子目录。
 
 ---
 
-## 十二、附录 A：参考实现（可直接抄写为 4 个脚本）
+## 十二、附录 A：参考实现（可直接抄写为 6 个脚本）
 
 > 以下为经过实测的完整实现。写入工作目录后按顺序执行即可。若目标智能体具备文件写入能力，直接照抄；否则按逻辑自行实现。
 
@@ -179,6 +210,124 @@
 ```python
 BASE = r"D:\tools\workbuddy\数据清洗"   # ← 改成你的工作目录
 ```
+
+### `step_newdata.py` —— 步骤 0：合并 `新数据/` 的测速 CSV（无 CSV 则跳过）
+```python
+# -*- coding: utf-8 -*-
+"""合并 新数据/ 下的测速 CSV -> go.csv；其 IP 增量并入 all.txt；再重生成 all.csv。
+   无 CSV 时打印 SKIP 并 exit 0。按 IP 去重，幂等。"""
+import csv, datetime, ipaddress, os, re, shutil, subprocess, sys
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+NEW_DIR = os.path.join(BASE, "新数据")
+GO, ALL_TXT, ALL_CSV = (os.path.join(BASE, n) for n in ("go.csv", "all.txt", "all.csv"))
+ENRICH = os.path.join(BASE, "enrich_cidrs.py")
+NEW_IPS_OUT = os.path.join(BASE, "新增IP_新数据.txt")
+BAK = (os.path.join(BASE, ".workbuddy", "_backup")   # 本地项目
+       if os.path.isdir(os.path.join(BASE, ".workbuddy"))
+       else os.path.join(BASE, ".cache", "_backup")) # 云端仓库（.cache 已被 gitignore）
+KEEP = ["IP 地址", "平均延迟", "下载速度(MB/s)", "地区码"]
+IP_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+if not os.path.isdir(NEW_DIR):
+    print(f"SKIP: 目录不存在 {NEW_DIR} —— 跳过新数据合并步骤"); sys.exit(0)
+files = sorted(os.path.join(dp, f) for dp, _, fs in os.walk(NEW_DIR) for f in fs if f.lower().endswith(".csv"))
+if not files:
+    print(f"SKIP: {NEW_DIR} 下没有 CSV 文件 —— 跳过新数据合并步骤"); sys.exit(0)
+print(f"新数据 CSV: {len(files)} 个")
+
+def pick(hdr, *kws):
+    for kw in kws:
+        for k in hdr:
+            if k and kw in k: return k
+    return None
+def num(v):
+    try: return float(str(v).strip())
+    except (ValueError, TypeError): return None
+def cand(lat, spd, area):          # (有指标, -延迟, 速度, 有地区码) —— 越大越好
+    l = num(lat)
+    return (1 if l is not None else 0, -(l or 0.0), num(spd) or 0.0, 1 if area else 0)
+def stamp(): return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+def backup(path, tag):
+    os.makedirs(BAK, exist_ok=True)
+    if os.path.exists(path): shutil.copy2(path, os.path.join(BAK, f"{tag}.{stamp()}.bak"))
+
+best, rows_read, bad, odd, nometric = {}, 0, 0, 0, 0
+for p in files:
+    text = open(p, encoding="utf-8-sig", newline="").read()
+    if not text.strip(): continue
+    lines = text.splitlines()
+    hdr = next(csv.reader([lines[0]])) if lines else []
+    if hdr and hdr[0].strip().startswith("IP"):
+        rd = csv.DictReader(lines)
+        c_ip, c_lat = pick(rd.fieldnames, "IP"), pick(rd.fieldnames, "平均延迟", "延迟")
+        c_spd, c_area = pick(rd.fieldnames, "下载速度", "速度"), pick(rd.fieldnames, "地区码", "地区")
+        if not c_ip: odd += 1; continue
+        for r in rd:
+            ip = (r.get(c_ip) or "").strip()
+            if not ip: continue
+            if not IP_RE.match(ip): bad += 1; continue
+            lat = (r.get(c_lat) or "").strip() if c_lat else ""
+            spd = (r.get(c_spd) or "").strip() if c_spd else ""
+            area = (r.get(c_area) or "").strip() if c_area else ""
+            rows_read += 1
+            if num(lat) is None: nometric += 1
+            c = cand(lat, spd, area)
+            if ip not in best or c > best[ip][0]: best[ip] = [c, lat, spd, area]
+    else:                                    # 无表头兜底：裸 IP / IP:port
+        odd += 1
+        for ln in lines:
+            ip = ln.strip().split(":")[0].strip()
+            if not ip: continue
+            if not IP_RE.match(ip): bad += 1; continue
+            rows_read += 1; nometric += 1
+            c = cand("", "", "")
+            if ip not in best or c > best[ip][0]: best[ip] = [c, "", "", ""]
+print(f"读入 {rows_read} 行 | 非法 {bad} | 无表头文件 {odd} | 无指标 {nometric} | 唯一 IP {len(best)}")
+
+merged = {}
+if os.path.exists(GO):
+    rd = csv.DictReader(open(GO, encoding="utf-8-sig", newline=""))
+    c_ip = pick(rd.fieldnames, "IP") or KEEP[0]; c_lat = pick(rd.fieldnames, "平均延迟", "延迟") or KEEP[1]
+    c_spd = pick(rd.fieldnames, "下载速度", "速度") or KEEP[2]; c_area = pick(rd.fieldnames, "地区码", "地区") or KEEP[3]
+    for r in rd:
+        ip = (r.get(c_ip) or "").strip()
+        if not ip or not IP_RE.match(ip): continue
+        lat = (r.get(c_lat) or "").strip(); spd = (r.get(c_spd) or "").strip(); area = (r.get(c_area) or "").strip()
+        c = cand(lat, spd, area)
+        if ip not in merged or c > merged[ip][0]: merged[ip] = [c, lat, spd, area]
+
+before, added, upg = len(merged), 0, 0
+for ip, v in best.items():
+    if ip not in merged: added += 1
+    elif v[0] > merged[ip][0]: upg += 1
+    if ip not in merged or v[0] > merged[ip][0]: merged[ip] = v
+backup(GO, "go.csv")
+with open(GO, "w", encoding="utf-8-sig", newline="") as fh:
+    w = csv.writer(fh); w.writerow(KEEP)
+    for ip, v in sorted(merged.items(), key=lambda kv: int(ipaddress.ip_address(kv[0]))):
+        w.writerow([ip, v[1], v[2], v[3]])
+print(f"go.csv: {before} -> {len(merged)}（新增 {added}，补全/升级 {upg}）")
+
+cur = {l.strip() for l in open(ALL_TXT, encoding="utf-8", errors="ignore") if l.strip()} if os.path.exists(ALL_TXT) else set()
+new_ips = set(best) - cur
+k = lambda x: int(ipaddress.ip_address(x))
+if new_ips:
+    backup(ALL_TXT, "all.txt")
+    open(ALL_TXT, "w", encoding="utf-8").write("\n".join(sorted(cur | set(best), key=k)) + "\n")
+    open(NEW_IPS_OUT, "w", encoding="utf-8").write("\n".join(sorted(new_ips, key=k)) + "\n")
+    print(f"all.txt: {len(cur)} -> {len(cur | set(best))}（净新增 {len(new_ips)}）")
+else:
+    print(f"all.txt: {len(cur)} 行，无新增")
+
+if new_ips or not os.path.exists(ALL_CSV):
+    print("--- 调用 enrich_cidrs.py 重生成 all.csv ---")
+    if subprocess.run([sys.executable, "-u", ENRICH], cwd=BASE).returncode != 0:
+        print("WARN: enrich_cidrs.py 失败，可重跑本脚本补齐")
+print("\nSTEP 新数据合并: DONE")
+```
+
+> 若目标环境只有本提示词、没有现成脚本，可直接把上面的 `enrich_cidrs.py` 与 `step_newdata.py` 一起落盘，二者靠文件名互相调用。
 
 ### `fetch_round2.py` —— 采集 + 解析 + 求新增
 ```python
@@ -391,14 +540,16 @@ print(f"go.csv 原 {before} 行 -> 新增 {added} -> 共 {len(ordered)} 行")
 
 ### 执行顺序
 ```bash
+python -u step_newdata.py             # ⓪ 条件步骤：合并 新数据/ 的测速 CSV（无 CSV 自动 SKIP）
 python -u fetch_round2.py            # ① 采集解析 + 求新增
 python -u apply_round2.py            # ② 并集更新 all.txt
 python -u enrich_cidrs.py            # ③ 重生成 all.csv（可多轮重跑直到 0 空白）
 python -u update_go.py 新增IP.txt    # ④ 更新 go.csv
+python -u verify_round.py            # ⑤ 严格校验（必须 ALL PASS）
 ```
 
 ---
 
 ## 十三、附录 B：一句话版（适合定时任务/自动化）
 
-> 采集 `dns.txt` 的域名 A 记录，并抓取 zip.cm.edu.kg/all.txt、cfipv4db 的 high_score_ips.txt、xgonce/Cloudflare_IP 的 result.csv（改用 raw 地址）三个外链源，去重后与工作目录 `all.txt` 比较：若三个主文件已存在则只并入新增 IP（增量），否则从零构建（全量）。最终维护 `all.txt`（唯一 IP 升序）、`all.csv`（按 /24 归并，含 CIDR 归属厂商/归属地，按 IP 数量降序，UTF-8 with BOM）、`go.csv`（IP 升序）三个文件。完成后校验升序、唯一、新增 IP 已进入三个文件、归属零空白，并汇报净新增数、Top 10 CIDR 与各源解析失败情况。
+> **先检查工作目录下的 `新数据/` 文件夹**：里面有测速 CSV 就把它们合并进 `go.csv`（只保留 `IP 地址/平均延迟/下载速度(MB/s)/地区码` 四列，按 IP 去重、保留平均延迟最低的记录，原有无指标的记录要被补全，IP 升序、UTF-8 with BOM），并把其中不在 `all.txt` 的 IP 增量并入 `all.txt`、重生成 `all.csv`；没有 CSV 或文件夹不存在则**跳过这一步**（打印 SKIP 即可，不是错误）。然后采集 `dns.txt` 的域名 A 记录，并抓取 zip.cm.edu.kg/all.txt、cfipv4db 的 high_score_ips.txt、xgonce/Cloudflare_IP 的 result.csv（改用 raw 地址）三个外链源，去重后与工作目录 `all.txt` 比较：若三个主文件已存在则只并入新增 IP（增量），否则从零构建（全量）。最终维护 `all.txt`（唯一 IP 升序）、`all.csv`（按 /24 归并，含 CIDR 归属厂商/归属地，按 IP 数量降序，UTF-8 with BOM）、`go.csv`（IP 升序）三个文件。完成后校验升序、唯一、新增 IP 已进入三个文件、归属零空白、`新数据` CSV 的 IP 已全部落入 `go.csv` 与 `all.txt`、重复运行结果不变，并汇报净新增数、Top 10 CIDR、各源解析失败情况，以及「新数据」步骤是跳过还是执行了。
