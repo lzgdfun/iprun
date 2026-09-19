@@ -4,7 +4,7 @@ name: IP 清单定时更新（全量/增量）
 # GitHub Actions 的 cron 一律使用 UTC，且高峰期可能有几分钟延迟。
 on:
   schedule:
-    - cron: '25 14 * * *'
+    - cron: '0 16 * * 4'
   workflow_dispatch: {}      # 支持手动触发（用于首次验证或补跑）
 
 # 需要写权限才能把更新结果提交回仓库
@@ -31,6 +31,9 @@ jobs:
 
       - name: 首次引导（用种子文件初始化 all.txt / go.csv）
         run: python -u bootstrap.py
+
+      - name: 合并「新数据」文件夹的测速 CSV（无 CSV 自动跳过）
+        run: python -u step_newdata.py
 
       - name: 采集四个数据源 + 计算净新增
         run: python -u fetch_sources.py
